@@ -17,7 +17,7 @@ public class CronosService {
     private static final Logger LOGGER = LoggerFactory.getLogger(CronosService.class);
     
     private final Web3j web3j;
-    // Pour le hackathon, on stocke les hashs utilisés en mémoire pour éviter le "Replay Attack"
+    // Cache simple pour éviter le "Replay Attack" (Note: Redis serait mieux pour la prod)
     private final ConcurrentHashMap<String, Boolean> usedHashes = new ConcurrentHashMap<>();
 
     public CronosService(String rpcUrl) {
@@ -25,51 +25,59 @@ public class CronosService {
     }
 
     public boolean verifyTransaction(String txHash, double expectedAmount, String expectedReceiver) {
+        // 1. Vérifier si le hash a déjà été utilisé localement
         if (usedHashes.containsKey(txHash)) {
-            LOGGER.warn("❌ Ce hash a déjà été utilisé ! TxHash: {}", txHash);
+            LOGGER.warn("❌ REPLAY ATTACK: Ce hash a déjà été utilisé ! TxHash: {}", txHash);
             return false;
         }
 
         try {
-            // 1. Récupérer la transaction
+            // 2. Récupérer la transaction sur la blockchain
             Optional<Transaction> txOptional = web3j.ethGetTransactionByHash(txHash).send().getTransaction();
             if (txOptional.isEmpty()) {
-                LOGGER.warn("❌ Transaction non trouvée. TxHash: {}", txHash);
+                LOGGER.warn("❌ Transaction introuvable sur Cronos. TxHash: {}", txHash);
                 return false;
             }
 
             Transaction tx = txOptional.get();
 
-            // 2. Vérifier le destinataire
+            // 3. Vérifier le destinataire (Case insensitive)
             if (!tx.getTo().equalsIgnoreCase(expectedReceiver)) {
-                LOGGER.warn("❌ Mauvais destinataire. Attendu: {}, Reçu: {}, TxHash: {}", 
-                    expectedReceiver, tx.getTo(), txHash);
+                LOGGER.warn("❌ Mauvais wallet destinataire. Reçu: {}, Attendu: {}", tx.getTo(), expectedReceiver);
                 return false;
             }
 
-            // 3. Vérifier le montant (Conversion Wei -> CRO)
-            BigDecimal valueInCro = Convert.fromWei(new BigDecimal(tx.getValue()), Convert.Unit.ETHER);
-            if (valueInCro.doubleValue() < expectedAmount) {
-                LOGGER.warn("❌ Montant insuffisant: {}. Attendu: {}, TxHash: {}", 
-                    valueInCro, expectedAmount, txHash);
+            // 4. Vérifier le montant (Conversion précise Wei -> CRO)
+            BigDecimal valueInWei = new BigDecimal(tx.getValue());
+            BigDecimal valueInCro = Convert.fromWei(valueInWei, Convert.Unit.ETHER);
+            
+            // On utilise compareTo pour la précision BigDecimal (valeur >= attendu)
+            if (valueInCro.compareTo(BigDecimal.valueOf(expectedAmount)) < 0) {
+                LOGGER.warn("❌ Montant insuffisant: {} CRO. Attendu: {} CRO", valueInCro, expectedAmount);
                 return false;
             }
 
-            // 4. Vérifier que la transaction est bien minée (Succès)
-            Optional<TransactionReceipt> receipt = web3j.ethGetTransactionReceipt(txHash).send().getTransactionReceipt();
-            if (receipt.isEmpty() || !receipt.get().isStatusOK()) {
-                LOGGER.warn("❌ Transaction échouée ou en attente. TxHash: {}", txHash);
+            // 5. Vérifier que la transaction est bien un SUCCÈS (minée)
+            Optional<TransactionReceipt> receiptCheck = web3j.ethGetTransactionReceipt(txHash).send().getTransactionReceipt();
+            
+            if (receiptCheck.isEmpty()) {
+                LOGGER.warn("❌ Reçu de transaction introuvable (en attente ?). TxHash: {}", txHash);
+                return false;
+            }
+            
+            TransactionReceipt receipt = receiptCheck.get();
+            if (!receipt.isStatusOK()) {
+                LOGGER.warn("❌ La transaction a échoué (Gas error ou Revert). TxHash: {}", txHash);
                 return false;
             }
 
-            // Tout est bon, on marque le hash comme utilisé
+            // TOUT EST BON !
             usedHashes.put(txHash, true);
-            LOGGER.info("✅ Transaction vérifiée avec succès. TxHash: {}, Montant: {}, Destinataire: {}", 
-                txHash, valueInCro, expectedReceiver);
+            LOGGER.info("✅ PAIEMENT VALIDÉ : {} CRO reçus. TxHash: {}", valueInCro, txHash);
             return true;
 
         } catch (Exception e) {
-            LOGGER.error("❌ Erreur lors de la vérification de la transaction. TxHash: {}", txHash, e);
+            LOGGER.error("❌ Erreur technique lors de la vérification Web3j. TxHash: {}", txHash, e);
             return false;
         }
     }
